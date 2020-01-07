@@ -1,18 +1,21 @@
 language: python
 
 python:
-  - "3.4"
   - "3.5"
   - "3.6"
+  - "3.7"
   - "3.7-dev"
 
-cache: pip
+services:
+  - docker
 
-# command to install dependencies
 install:
-  - pip install -r requirements.txt
+  - export PIPENV_IGNORE_VIRTUALENVS=1
+  - pipenv install --dev
 
-# command to run tests
 script:
-  - sphinx-build -nWT -b dummy doc doc/_build/html
-  - pytest
+  - pipenv run pytest
+  - pipenv run sphinx-build -nWT -b dummy doc doc/_build/html
+  - python setup.py install
+  - ./docker_ctl build
+  - docker run --rm -it trading_bot bash -c "pipenv install --dev && pipenv run pytest"

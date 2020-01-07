@@ -4,57 +4,30 @@ import inspect
 import pytest
 import json
 import pandas as pd
+from enum import Enum
 
 currentdir = os.path.dirname(os.path.abspath(inspect.getfile(inspect.currentframe())))
 parentdir = os.path.dirname(currentdir)
-sys.path.insert(0,'{}/src'.format(parentdir))
+sys.path.insert(0, "{}/src".format(parentdir))
 
 from Strategies.WeightedAvgPeak import WeightedAvgPeak
-from Utils import TradeDirection
+from Utility.Utils import TradeDirection
+from Interfaces.Market import Market
+from Components.Broker import Broker
+from Components.IGInterface import IGInterface
+from Components.AVInterface import AVInterface
+from common.MockRequests import (
+    ig_request_login,
+    ig_request_set_account,
+    ig_request_market_info,
+    ig_request_prices,
+    ig_request_trade,
+    ig_request_confirm_trade,
+)
 
-class MockBroker:
-    """
-    Mock broker interface class
-    """
-    def __init__(self, mockFilepath, mockPricesFilepath):
-        self.mockFilepath = mockFilepath
-        self.mockPricesFilepath = mockPricesFilepath
-        pass
+class Mock_Interval(Enum):
+    MOCK="mock"
 
-    def get_market_info(self, epic_id):
-        # Read mock file
-        try:
-            with open(self.mockFilepath, 'r') as file:
-                mock = json.load(file)
-        except IOError:
-            exit()
-        return mock
-
-    def get_prices(self, epic_id, interval, range):
-        # Read mock file
-        try:
-            with open(self.mockPricesFilepath, 'r') as file:
-                mock = json.load(file)
-        except IOError:
-            exit()
-        return mock
-
-class MockAV:
-    """
-    Mock AlphaVantage interface class
-    """
-    def __init__(self, mockFilepath):
-        self.mockFilepath = mockFilepath
-
-    def weekly(self, marketId):
-        # Read mock file
-        try:
-            with open(self.mockFilepath, 'r') as file:
-                mock = json.load(file)
-                px = pd.DataFrame.from_dict(mock['Weekly Time Series'], orient='index', dtype=float)
-        except IOError:
-            exit()
-        return px
 
 @pytest.fixture
 def config():
@@ -63,22 +36,62 @@ def config():
     """
     # Read configuration file
     try:
-        with open('config/config.json', 'r') as file:
+        with open("config/config.json", "r") as file:
             config = json.load(file)
-            config['general']['use_av_api'] = True
     except IOError:
         exit()
     return config
 
 
-def test_find_trade_signal(config):
-    services = {
-        'broker': MockBroker('test/test_data/mock_ig_market_info.json',
-                                'test/test_data/mock_ig_historic_price.json'),
-        'alpha_vantage': MockAV('test/test_data/mock_av_weekly.json')
+@pytest.fixture
+def credentials():
+    """
+    Returns a dict with credentials parameters
+    """
+    return {
+        "username": "user",
+        "password": "pwd",
+        "api_key": "12345",
+        "account_id": "12345",
+        "av_api_key": "12345",
     }
-    strategy = WeightedAvgPeak(config, services)
-    tradeDir, limit, stop = strategy.find_trade_signal('MOCK')
+
+
+def create_mock_market(broker):
+    data = broker.get_market_info("mock")
+    market = Market()
+    market.epic = data["epic"]
+    market.id = data["market_id"]
+    market.name = data["name"]
+    market.bid = data["bid"]
+    market.offer = data["offer"]
+    market.high = data["high"]
+    market.low = data["low"]
+    market.stop_distance_min = data["stop_distance_min"]
+    return market
+
+
+def test_find_trade_signal(config, credentials, requests_mock):
+    ig_request_login(requests_mock)
+    ig_request_set_account(requests_mock)
+    ig_request_market_info(requests_mock)
+    ig_request_prices(requests_mock)
+    ig_request_trade(requests_mock)
+    ig_request_confirm_trade(requests_mock)
+
+    services = {
+        "ig_index": IGInterface(config, credentials),
+        "alpha_vantage": AVInterface(credentials["av_api_key"], config),
+    }
+    broker = Broker(config, services)
+    broker.use_av_api = False
+
+    strategy = WeightedAvgPeak(config, broker)
+
+    # Need to use a mock enum as the requests_mock expect "mock" as interval
+    prices = broker.get_prices("mock", "mock", Mock_Interval.MOCK, "mock")
+    market = create_mock_market(broker)
+    tradeDir, limit, stop = strategy.find_trade_signal(market, prices)
 
     assert tradeDir is not None
     assert limit is None

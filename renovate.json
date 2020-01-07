@@ -1,0 +1,12 @@
+{
+  "extends": [
+    "config:base"
+  ],
+  "baseBranches": ["master"],
+  "pipenv": {
+    "enabled": true
+  },
+  "pip_setup": {
+      "enabled": true
+  }
+}

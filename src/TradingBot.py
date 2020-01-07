@@ -1,23 +1,33 @@
 import logging
 import json
-from pathlib import Path
 import pytz
 import time
-import datetime as dt
+from datetime import datetime as dt
 import os
 import sys
 import inspect
-from random import shuffle
+import traceback
+import argparse
+import numpy
 
-currentdir = os.path.dirname(os.path.abspath(
-    inspect.getfile(inspect.currentframe())))
+currentdir = os.path.dirname(os.path.abspath(inspect.getfile(inspect.currentframe())))
 parentdir = os.path.dirname(currentdir)
 sys.path.insert(0, parentdir)
 
-from Utils import Utils, TradeDirection, MarketSource
-from Interfaces.IGInterface import IGInterface
-from Interfaces.AVInterface import AVInterface
+from Utility.Utils import (
+    Utils,
+    TradeDirection,
+    NotSafeToTradeException,
+    MarketClosedException,
+)
+from Components.IGInterface import IGInterface
+from Components.AVInterface import AVInterface
 from Strategies.StrategyFactory import StrategyFactory
+from Components.Broker import Broker
+from Components.MarketProvider import MarketProvider, MarketSource
+from Components.Backtester import Backtester
+from Components.TimeProvider import TimeProvider, TimeAmount
+
 
 class TradingBot:
     """
@@ -25,12 +35,17 @@ class TradingBot:
     broker interface, the strategy or the epic_ids list
     """
 
-    def __init__(self):
+    def __init__(self, time_provider=None, config_filepath=None):
+        # Time manager
+        self.time_provider = time_provider if time_provider else TimeProvider()
         # Set timezone
         set(pytz.all_timezones_set)
 
         # Load configuration
-        config = self.load_json_file('../config/config.json')
+        if config_filepath is None:
+            home_path = os.path.expanduser("~")
+            config_filepath = "{}/.TradingBot/config/config.json".format(home_path)
+        config = self.load_json_file(config_filepath)
         self.read_configuration(config)
 
         # Read credentials file
@@ -39,16 +54,16 @@ class TradingBot:
         # Setup the global logger
         self.setup_logging()
 
-        # Positions container
-        self.positions = None
-
-        # Init trade services
-        services = self.init_trading_services(config, credentials)
+        # Init trade services and create the broker interface
+        self.broker = self.init_trading_services(config, credentials)
 
         # Create strategy from the factory class
-        self.strategy = StrategyFactory(config, services).make_strategy(
-            self.active_strategy)
+        self.strategy = StrategyFactory(config, self.broker).make_strategy(
+            self.active_strategy
+        )
 
+        # Create the market provider
+        self.market_provider = MarketProvider(config, self.broker)
 
     def load_json_file(self, filepath):
         """
@@ -58,53 +73,57 @@ class TradingBot:
             - Return a dictionary of the loaded json
         """
         try:
-            with open(filepath, 'r') as file:
+            with open(filepath, "r") as file:
                 return json.load(file)
         except IOError:
             logging.error("File not found ({})".format(filepath))
-            exit()
-
+            exit(1)
 
     def read_configuration(self, config):
         """
         Read the configuration from the config json
         """
-        self.epic_ids_filepath = config['general']['epic_ids_filepath']
-        self.credentials_filepath = config['general']['credentials_filepath']
-        self.debug_log = config['general']['debug_log']
-        self.enable_log = config['general']['enable_log']
-        self.log_file = config['general']['log_file']
-        self.time_zone = config['general']['time_zone']
-        self.max_account_usable = config['general']['max_account_usable']
-        self.use_av_api = config['general']['use_av_api']
-        self.market_source = MarketSource(config['general']['market_source']['value'])
-        self.watchlist_name = config['general']['watchlist_name']
-        # AlphaVantage limits to 5 calls per minute
-        self.timeout = 12 if self.use_av_api else 2
-        self.active_strategy = config['general']['active_strategy']
-
+        home = os.path.expanduser("~")
+        self.epic_ids_filepath = config["general"]["epic_ids_filepath"].replace(
+            "{home}", home
+        )
+        self.credentials_filepath = config["general"]["credentials_filepath"].replace(
+            "{home}", home
+        )
+        self.debug_log = config["general"]["debug_log"]
+        self.enable_log = config["general"]["enable_log"]
+        self.log_file = config["general"]["log_file"].replace("{home}", home)
+        self.time_zone = config["general"]["time_zone"]
+        self.max_account_usable = config["general"]["max_account_usable"]
+        self.active_strategy = config["general"]["active_strategy"]
+        self.spin_interval = config["general"]["spin_interval"]
 
     def setup_logging(self):
         """
         Setup the global logging settings
         """
+        # Clean logging handlers
+        for handler in logging.root.handlers[:]:
+            logging.root.removeHandler(handler)
+
         # Define the global logging settings
         debugLevel = logging.DEBUG if self.debug_log else logging.INFO
         # If enabled define log file filename with current timestamp
         if self.enable_log:
             log_filename = self.log_file
-            time_str = dt.datetime.now().isoformat()
-            time_suffix = time_str.replace(':', '_').replace('.', '_')
-            home = str(Path.home())
-            log_filename = log_filename.replace('{timestamp}', time_suffix).replace('{home}', home)
+            time_str = dt.now().isoformat()
+            time_suffix = time_str.replace(":", "_").replace(".", "_")
+            log_filename = log_filename.replace("{timestamp}", time_suffix)
             os.makedirs(os.path.dirname(log_filename), exist_ok=True)
-            logging.basicConfig(filename=log_filename,
-                            level=debugLevel,
-                            format="[%(asctime)s] %(levelname)s: %(message)s")
+            logging.basicConfig(
+                filename=log_filename,
+                level=debugLevel,
+                format="[%(asctime)s] %(levelname)s: %(message)s",
+            )
         else:
-            logging.basicConfig(level=debugLevel,
-                            format="[%(asctime)s] %(levelname)s: %(message)s")
-
+            logging.basicConfig(
+                level=debugLevel, format="[%(asctime)s] %(levelname)s: %(message)s"
+            )
 
     def init_trading_services(self, config, credentials):
         """
@@ -113,205 +132,223 @@ class TradingBot:
 
             - **config** The configuration json
             - **credentials** The credentials json
+            - return: An instance of Broker class initialised
         """
-        # Create IG interface
-        self.IG = IGInterface(config)
-        # Init the IG interface
-        if not self.IG.authenticate(credentials):
-            logging.error("Authentication failed")
-            exit()
-
-        # Init AlphaVantage interface
-        self.AV = AVInterface(credentials['av_api_key'])
-
-        # Create dict of services
-        return {
-            "broker": self.IG,
-            "alpha_vantage": self.AV
+        services = {
+            "ig_index": IGInterface(config, credentials),
+            "alpha_vantage": AVInterface(credentials["av_api_key"], config),
         }
+        return Broker(config, services)
 
-
-    def load_epic_ids_from_local_file(self, filepath):
+    def start(self):
         """
-        Read a file from filesystem containing a list of epic ids.
-        The filepath is defined in config.json file
-        Returns a 'list' of strings where each string is a market epic
-        """
-        # define empty list
-        epic_ids = []
-        try:
-            # open file and read the content in a list
-            with open(filepath, 'r') as filehandle:
-                filecontents = filehandle.readlines()
-                for line in filecontents:
-                    # remove linebreak which is the last character of the string
-                    current_epic_id = line[:-1]
-                    epic_ids.append(current_epic_id)
-        except IOError:
-            # Create the file empty
-            logging.error('{} does not exist!'.format(filepath))
-        if len(epic_ids) < 1:
-            logging.error("Epic list is empty!")
-        return epic_ids
-
-
-    def start(self, argv):
-        """
-        Starts the TradingBot
+        Starts the TradingBot main loop
+        - process open positions
+        - process markets from market source
+        - wait for configured wait time
+        - start over
         """
         while True:
-            if Utils.is_market_open(self.time_zone):
-                # Process open positions
-                self.positions = self.IG.get_open_positions()
-                self.process_open_positions(self.positions)
+            try:
+                # Process current open positions
+                self.process_open_positions()
+                # Now process markets from the configured market source
+                self.process_market_source()
+                # Wait for the next spin before starting over
+                self.time_provider.wait_for(TimeAmount.SECONDS, self.spin_interval)
+            except MarketClosedException:
+                logging.warning("Market is closed: stop processing")
+                self.time_provider.wait_for(TimeAmount.NEXT_MARKET_OPENING)
+            except NotSafeToTradeException:
+                self.time_provider.wait_for(TimeAmount.SECONDS, self.spin_interval)
+            except StopIteration:
+                self.time_provider.wait_for(TimeAmount.SECONDS, self.spin_interval)
+            except Exception as e:
+                logging.error("Generic exception caught: {}".format(e))
+                logging.debug(traceback.format_exc())
+                logging.debug(sys.exc_info()[0])
+                continue
 
-                if self.market_source == MarketSource.LIST:
-                    self.process_epic_list(
-                        self.load_epic_ids_from_local_file(
-                            self.epic_ids_filepath))
-                elif self.market_source == MarketSource.WATCHLIST:
-                    self.process_watchlist(self.watchlist_name)
-                elif self.market_source == MarketSource.API:
-                    # Calling with empty strings starts market navigation from highest level
-                    self.process_market_exploration('180500')
-
-                # Wait for next spin loop as configured in the strategy
-                seconds = self.strategy.get_seconds_to_next_spin()
-                logging.info("Wait for {0:.2f} seconds before next spin".format(seconds))
-                time.sleep(seconds)
-            else:
-                self.wait_for_next_market_opening()
-
-
-    def process_watchlist(self, watchlist_name):
+    def process_open_positions(self):
         """
-        Process the markets included in the given IG watchlist
-
-            - **watchlist_name**: IG watchlist name
+        Fetch open positions markets and run the strategy against them closing the
+        trades if required
         """
-        markets = self.IG.get_markets_from_watchlist(self.watchlist_name)
-        if markets is None:
-            logging.error("Watchlist {} not found!".format(watchlist_name))
+        positions = self.broker.get_open_positions()
+        # Do not run until we know the current open positions
+        if positions is None:
+            logging.warning("Unable to fetch open positions! Will try again...")
+            raise RuntimeError("Unable to fetch open positions")
+        for epic in [item["market"]["epic"] for item in positions["positions"]]:
+            market = self.market_provider.get_market_from_epic(epic)
+            self.process_market(market, positions)
+
+    def process_market_source(self):
+        """
+        Process markets from the configured market source
+        """
+        while True:
+            market = self.market_provider.next()
+            positions = self.broker.get_open_positions()
+            if positions is None:
+                logging.warning("Unable to fetch open positions! Will try again...")
+                raise RuntimeError("Unable to fetch open positions")
+            self.process_market(market, positions)
+
+    def process_market(self, market, open_positions):
+        """Spin the strategy on all the markets"""
+        self.safety_checks()
+        logging.info("Processing {}".format(market.id))
+        try:
+            self.strategy.set_open_positions(open_positions)
+            trade, limit, stop = self.strategy.run(market)
+            self.process_trade(market, trade, limit, stop, open_positions)
+        except Exception as e:
+            logging.error("Strategy exception caught: {}".format(e))
+            logging.debug(traceback.format_exc())
+            logging.debug(sys.exc_info()[0])
             return
-        for m in markets:
-            if not self.process_market(m['epic']):
-                return
-
-
-    def process_market_exploration(self, node_id):
-        """
-        Navigate the markets using IG API to fetch markets id dinamically
-
-            - **node_id**: The node id to navigate markets in
-        """
-        node = self.IG.navigate_market_node(node_id)
-        if 'nodes' in node and isinstance(node['nodes'], list):
-            for node in node['nodes']:
-                self.process_market_exploration(node['id'])
-        if 'markets' in node and isinstance(node['markets'], list):
-            for market in node['markets']:
-                if any(["DFB" in str(market['epic']),
-                        "TODAY" in str(market['epic']),
-                        "DAILY" in str(market['epic'])]):
-                    if not self.process_market(market['epic']):
-                        return
-
-
-    def process_epic_list(self, epic_list):
-        """
-        Process the given list of epic ids, one by one to find new trades
-
-            - **epic_list**: list of epic ids as strings
-        """
-        shuffle(epic_list)
-        logging.info("Processing epic list of length: {}".format(len(epic_list)))
-        for epic in epic_list:
-            if not self.process_market(epic):
-                return
-
-
-    def process_market(self, epic):
-        """
-        Process the givem epic using the defined strategy
-
-            - **epic**: string representing a market epic id
-            - Returns **False** if market is closed or if account reach maximum margin, otherwise **True**
-        """
-        percent_used = self.IG.get_account_used_perc()
-        if percent_used is None:
-            logging.warning("Stop trading because can't fetch percentage of account used")
-            return False
-        if percent_used >= self.max_account_usable:
-            logging.warning("Stop trading because {}% of account is used".format(str(percent_used)))
-            return False
-        if not Utils.is_market_open(self.time_zone):
-            logging.warn("Market is closed: stop processing")
-            return False
-        self.process_trade(epic)
-        return True
-
 
     def close_open_positions(self):
         """
         Closes all the open positions in the account
         """
         logging.info("Closing all the open positions...")
-        if self.IG.close_all_positions():
+        if self.broker.close_all_positions():
             logging.info("All the posisions have been closed.")
         else:
             logging.error("Impossible to close all open positions, retry.")
 
-
-    def wait_for_next_market_opening(self):
+    def safety_checks(self):
         """
-        Sleep until the next market opening. Takes into account weekends
-        and bank holidays in UK
-        """
-        seconds = Utils.get_seconds_to_market_opening(dt.datetime.now())
-        logging.info("Market is closed! Wait for {0:.2f} hours...".format(seconds / 3600))
-        time.sleep(seconds)
+        Perform some safety checks before running the strategy against the next market
 
-
-    def process_trade(self, epic):
+        Raise exceptions if not safe to trade
         """
-        Process a trade checking if it is a "close position" trade or a new action
-        """
-        logging.info("Processing {}".format(epic))
-        # Use strategy to analyse market
-        try:
-            trade, limit, stop = self.strategy.find_trade_signal(epic)
-        except Exception as e:
-            logging.error('Exception: {}'.format(e))
-            trade = TradeDirection.NONE
+        percent_used = self.broker.get_account_used_perc()
+        if percent_used is None:
+            logging.warning(
+                "Stop trading because can't fetch percentage of account used"
+            )
+            raise NotSafeToTradeException()
+        if percent_used >= self.max_account_usable:
+            logging.warning(
+                "Stop trading because {}% of account is used".format(str(percent_used))
+            )
+            raise NotSafeToTradeException()
+        if not self.time_provider.is_market_open(self.time_zone):
+            raise MarketClosedException()
 
-        if trade is not TradeDirection.NONE:
-            if self.positions is not None:
-                for item in self.positions['positions']:
+    def process_trade(self, market, direction, limit, stop, open_positions):
+        """
+        Process a trade checking if it is a "close position" trade or a new trade
+        """
+        # Perform trade only if required
+        if direction is not TradeDirection.NONE:
+            if open_positions is not None:
+                for item in open_positions["positions"]:
                     # If a same direction trade already exist, don't trade
-                    if item['market']['epic'] == epic and trade.name == item['position']['direction']:
-                        logging.info( "There is already an open position for this epic, skip trade")
+                    if (
+                        item["market"]["epic"] == market.epic
+                        and direction.name == item["position"]["direction"]
+                    ):
+                        logging.info(
+                            "There is already an open position for this epic, skip trade"
+                        )
+                        return
                     # If a trade in opposite direction exist, close the position
-                    elif item['market']['epic'] == epic and trade.name != item['position']['direction']:
-                        self.IG.close_position(item)
-                self.IG.trade(epic, trade.name, limit, stop)
+                    elif (
+                        item["market"]["epic"] == market.epic
+                        and direction.name != item["position"]["direction"]
+                    ):
+                        self.broker.close_position(item)
+                        return
+                self.broker.trade(market.epic, direction.name, limit, stop)
             else:
-                logging.error(
-                    "Unable to fetch open positions! Avoid trading this epic")
-        # Sleep for the defined timeout
-        time.sleep(self.timeout)
+                logging.error("Unable to fetch open positions! Avoid trading this epic")
 
-
-    def process_open_positions(self, positions):
+    def backtest(self, market_id, start_date, end_date, epic_id=None):
         """
-        process the open positions to find closing trades
-
-            - **positions**: json object containing open positions
-            - Returns **False** if an error occurs otherwise True
+        Backtest a market using the configured strategy
         """
-        if positions is not None:
-            logging.info("Processing open positions.")
-            self.process_epic_list([item['market']['epic'] for item in positions['positions']])
-            return True
-        else:
-            logging.warning("Unable to fetch open positions!")
-        return False
+        try:
+            start = dt.strptime(start_date, "%Y-%m-%d")
+            end = dt.strptime(end_date, "%Y-%m-%d")
+        except ValueError as e:
+            logging.error("Wrong date format! Must be YYYY-MM-DD")
+            logging.debug(e)
+            exit(1)
+
+        bt = Backtester(self.broker, self.strategy)
+
+        try:
+            market = (
+                self.market_provider.search_market(market_id)
+                if epic_id is None or epic_id is ""
+                else self.market_provider.get_market_from_epic(epic_id)
+            )
+        except Exception as e:
+            logging.error(e)
+            exit(1)
+
+        bt.start(market, start, end)
+        bt.print_results()
+
+
+def get_menu_parser():
+    VERSION = "1.2.0"
+    parser = argparse.ArgumentParser(prog="TradingBot")
+    main_group = parser.add_mutually_exclusive_group()
+    main_group.add_argument(
+        "-v", "--version", action="version", version="%(prog)s {}".format(VERSION)
+    )
+    main_group.add_argument(
+        "-c",
+        "--close_positions",
+        help="Close all the open positions",
+        action="store_true",
+    )
+    backtest_group = parser.add_argument_group("Backtesting")
+    backtest_group.add_argument(
+        "--backtest",
+        help="Backtest the market related to the specified id",
+        nargs=1,
+        metavar="MARKET_ID",
+    )
+    backtest_group.add_argument(
+        "--epic",
+        help="IG epic of the market to backtest. MARKET_ID will be ignored",
+        nargs=1,
+        metavar="EPIC_ID",
+        default=None,
+    )
+    backtest_group.add_argument(
+        "--start",
+        help="Start date for the strategy backtest",
+        nargs=1,
+        metavar="YYYY-MM-DD",
+        required="--backtest" in sys.argv,
+    )
+    backtest_group.add_argument(
+        "--end",
+        help="End date for the strategy backtest",
+        nargs=1,
+        metavar="YYYY-MM-DD",
+        required="--backtest" in sys.argv,
+    )
+    return parser.parse_args()
+
+
+def main():
+    tp = TimeProvider()
+    args = get_menu_parser()
+    if args.close_positions:
+        TradingBot(tp).close_open_positions()
+    elif args.backtest and args.start and args.end:
+        epic = args.epic[0] if args.epic else None
+        TradingBot(tp).backtest(args.backtest[0], args.start[0], args.end[0], epic)
+    else:
+        TradingBot(tp).start()
+
+if __name__ == "__main__":
+    main()

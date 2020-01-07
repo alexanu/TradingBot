@@ -20,13 +20,13 @@ sys.path.insert(0, os.path.abspath('../src'))
 # -- Project information -----------------------------------------------------
 
 project = 'TradingBot'
-copyright = '2018, Alberto Cardellini'
+copyright = '2019, Alberto Cardellini'
 author = 'Alberto Cardellini'
 
 # The short X.Y version
-version = ''
+version = '1.0'
 # The full version, including alpha/beta/rc tags
-release = '0.1.0'
+release = '1.0.0'
 
 
 # -- General configuration ---------------------------------------------------
@@ -42,6 +42,7 @@ extensions = [
     'sphinx.ext.autodoc',
     'sphinx.ext.coverage',
     'sphinx.ext.napoleon',
+    'sphinx.ext.viewcode',
     'm2r'
 ]
 
@@ -103,7 +104,7 @@ html_theme_options = {
 # Add any paths that contain custom static files (such as style sheets) here,
 # relative to this directory. They are copied after the builtin static files,
 # so a file named "default.css" will overwrite the builtin "default.css".
-html_static_path = ['_static']
+#html_static_path = ['_static']
 
 # Custom sidebar templates, must be a dictionary that maps document names
 # to template names.

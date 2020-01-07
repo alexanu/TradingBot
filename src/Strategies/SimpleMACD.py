@@ -1,20 +1,17 @@
 import logging
 import numpy as np
-import pandas as pd
-import requests
 import os
 import inspect
 import sys
-from datetime import datetime
+from datetime import datetime as dt
 
-currentdir = os.path.dirname(os.path.abspath(
-    inspect.getfile(inspect.currentframe())))
+currentdir = os.path.dirname(os.path.abspath(inspect.getfile(inspect.currentframe())))
 parentdir = os.path.dirname(currentdir)
 sys.path.insert(0, parentdir)
 
-from Interfaces.AVInterface import AVIntervals
+from Components.Broker import Interval
 from .Strategy import Strategy
-from Utils import Utils, TradeDirection
+from Utility.Utils import Utils, TradeDirection
 
 
 class SimpleMACD(Strategy):
@@ -25,159 +22,141 @@ class SimpleMACD(Strategy):
     Sell when the MACD cross below the MACD signal.
     """
 
-    def __init__(self, config, services):
-        super().__init__(config, services)
-        logging.info('Simple MACD strategy initialised.')
+    def __init__(self, config, broker):
+        super().__init__(config, broker)
+        logging.info("Simple MACD strategy initialised.")
 
     def read_configuration(self, config):
         """
         Read the json configuration
         """
-        self.spin_interval = config['strategies']['simple_macd']['spin_interval']
-        self.controlledRisk = config['ig_interface']['controlled_risk']
-        self.use_av_api = config['general']['use_av_api']
-        self.max_spread_perc = config['strategies']['simple_macd']['max_spread_perc']
-        self.limit_p = config['strategies']['simple_macd']['limit_perc']
-        self.stop_p = config['strategies']['simple_macd']['stop_perc']
+        self.max_spread_perc = config["strategies"]["simple_macd"]["max_spread_perc"]
+        self.limit_p = config["strategies"]["simple_macd"]["limit_perc"]
+        self.stop_p = config["strategies"]["simple_macd"]["stop_perc"]
 
+    def initialise(self):
+        """
+        Initialise SimpleMACD strategy
+        """
+        pass
 
-    def find_trade_signal(self, epic_id):
+    def fetch_datapoints(self, market):
+        """
+        Fetch historic MACD data
+        """
+        return self.broker.macd_dataframe(market.epic, market.id, Interval.DAY)
+
+    def find_trade_signal(self, market, datapoints):
         """
         Calculate the MACD of the previous days and find a cross between MACD
         and MACD signal
 
-            - **epic_id**: market epic as string
+            - **market**: Market object
+            - **datapoints**: datapoints used to analyse the market
             - Returns TradeDirection, limit_level, stop_level or TradeDirection.NONE, None, None
         """
-        # Fetch data for the market
-        marketId, current_bid, current_offer, limit_perc, stop_perc = self.get_market_snapshot(
-            epic_id)
+        limit_perc = self.limit_p
+        stop_perc = max(market.stop_distance_min, self.stop_p)
 
         # Spread constraint
-        if current_bid - current_offer > self.max_spread_perc:
+        if market.bid - market.offer > self.max_spread_perc:
             return TradeDirection.NONE, None, None
 
-        # Fetch historic prices and build a list with them ordered cronologically
-        px = self.get_dataframe_from_historic_prices(marketId, epic_id)
-
         # Find where macd and signal cross each other
+        px = datapoints
         px = self.generate_signals_from_dataframe(px)
 
         # Identify the trade direction looking at the last signal
         tradeDirection = self.get_trade_direction_from_signals(px)
         # Log only tradable epics
         if tradeDirection is not TradeDirection.NONE:
-            logging.info("SimpleMACD says: {} {}".format(
-                tradeDirection.name, marketId))
+            logging.info(
+                "SimpleMACD says: {} {}".format(tradeDirection.name, market.id)
+            )
 
         # Calculate stop and limit distances
         limit, stop = self.calculate_stop_limit(
-            tradeDirection, current_offer, current_bid, limit_perc, stop_perc)
+            tradeDirection, market.offer, market.bid, limit_perc, stop_perc
+        )
         return tradeDirection, limit, stop
 
-
-    def calculate_stop_limit(self, tradeDirection, current_offer, current_bid, limit_perc, stop_perc):
+    def calculate_stop_limit(
+        self, tradeDirection, current_offer, current_bid, limit_perc, stop_perc
+    ):
         """
         Calculate the stop and limit levels from the given percentages
         """
         limit = None
         stop = None
         if tradeDirection == TradeDirection.BUY:
-            limit = current_offer + \
-                Utils.percentage_of(limit_perc, current_offer)
+            limit = current_offer + Utils.percentage_of(limit_perc, current_offer)
             stop = current_bid - Utils.percentage_of(stop_perc, current_bid)
         elif tradeDirection == TradeDirection.SELL:
             limit = current_bid - Utils.percentage_of(limit_perc, current_bid)
-            stop = current_offer + \
-                Utils.percentage_of(stop_perc, current_offer)
+            stop = current_offer + Utils.percentage_of(stop_perc, current_offer)
         return limit, stop
 
-
-    def get_seconds_to_next_spin(self):
-        """
-        Calculate the amount of seconds to wait for between each strategy spin
-        """
-        # Run this strategy at market opening
-        return Utils.get_seconds_to_market_opening(datetime.now())
-
-
-    def get_market_snapshot(self, epic_id):
-        """
-        Fetch a market snapshot from the given epic id, and returns
-        the **marketId** and the bid/offer prices
-
-            - **epic_id**: market epic as string
-            - Returns marketId, bidPrice, offerPrice
-        """
-        # Fetch current market data
-        market = self.broker.get_market_info(epic_id)
-        # Safety checks
-        if (market is None
-            or 'markets' in market  # means that epic_id is wrong
-                or market['snapshot']['bid'] is None
-                or market['snapshot']['offer'] is None):
-            raise Exception
-
-        limit_perc = self.limit_p
-        stop_perc = max(
-            [market['dealingRules']['minNormalStopOrLimitDistance']['value'], self.stop_p])
-        if self.controlledRisk:
-            # +1 to avoid rejection
-            stop_perc = market['dealingRules']['minControlledRiskStopDistance']['value'] + 1
-        # Extract market Id
-        marketId = market['instrument']['marketId']
-        current_bid = market['snapshot']['bid']
-        current_offer = market['snapshot']['offer']
-
-        return marketId, current_bid, current_offer, limit_perc, stop_perc
-
-
-    def compute_macd_from_timeseries(self, prices):
-        prevBid = 0
-        hist_data = []
-        for p in prices['prices']:
-            if p['closePrice']['bid'] is None:
-                hist_data.append(prevBid)
-            else:
-                hist_data.append(p['closePrice']['bid'])
-                prevBid = p['closePrice']['bid']
-        # Calculate the MACD indicator
-        px = pd.DataFrame({'close': hist_data})
-        px['26_ema'] = pd.DataFrame.ewm(px['close'], span=26).mean()
-        px['12_ema'] = pd.DataFrame.ewm(px['close'], span=12).mean()
-        px['MACD'] = (px['12_ema'] - px['26_ema'])
-        px['MACD_Signal'] = px['MACD'].rolling(9).mean()
-        px['MACD_Hist'] = (px['MACD'] - px['MACD_Signal'])
-        return px
-
-
-    def get_dataframe_from_historic_prices(self, marketId, epic_id):
-        if self.use_av_api:
-            px = self.AV.macdext(marketId, AVIntervals.DAILY)
-            if px is None:
-                return None
-            px.index = range(len(px))
-        else:
-            prices = self.broker.get_prices(epic_id, 'DAY', 26)
-            if prices is None:
-                return None
-            px = self.compute_macd_from_timeseries(prices)
-        return px
-
-
     def generate_signals_from_dataframe(self, dataframe):
-        dataframe['positions'] = 0
-        #px.loc[9:, 'positions'] = np.where(px.loc[9:, 'MACD'] >= px.loc[9:, 'MACD_Signal'] , 1, 0)
-        dataframe.loc[9:, 'positions'] = np.where(dataframe.loc[9:, 'MACD_Hist'] >= 0, 1, 0)
-        # Highlight the direction of the crossing
-        dataframe['signals'] = dataframe['positions'].diff()
+        dataframe.loc[:, "positions"] = 0
+        dataframe.loc[:, "positions"] = np.where(dataframe["MACD_Hist"] >= 0, 1, 0)
+        dataframe.loc[:, "signals"] = dataframe["positions"].diff()
         return dataframe
-
 
     def get_trade_direction_from_signals(self, dataframe):
         tradeDirection = TradeDirection.NONE
-        if len(dataframe['signals']) > 0 and dataframe['signals'].iloc[-1] > 0:
-            tradeDirection = TradeDirection.BUY
-        elif len(dataframe['signals']) > 0 and dataframe['signals'].iloc[-1] < 0:
-            tradeDirection = TradeDirection.SELL
+        if len(dataframe["signals"]) > 0:
+            if dataframe["signals"].iloc[1] < 0:
+                tradeDirection = TradeDirection.BUY
+            elif dataframe["signals"].iloc[1] > 0:
+                tradeDirection = TradeDirection.SELL
         return tradeDirection
+
+    def backtest(self, market, start_date, end_date):
+        """Backtest the strategy
+        """
+        # Generic initialisations
+        self.broker.use_av_api = True
+        trades = []
+        # - Get price data for market
+        prices = self.broker.get_prices(market.epic, market.id, Interval.DAY, None)
+        # - Get macd data from broker forcing use of alpha_vantage
+        data = self.fetch_datapoints(market)
+        # - Simulate time passing by starting with N rows (from the bottom)
+        # and adding the next row (on the top) one by one, calling the strategy with
+        # the intermediate data and recording its output
+        datapoint_used = 26
+        while len(data) > datapoint_used:
+            current_data = data.tail(datapoint_used).copy()
+            datapoint_used += 1
+            # Get trade date
+            trade_dt = current_data.index.values[0].astype("M8[ms]").astype("O")
+            if start_date <= trade_dt <= end_date:
+                trade, limit, stop = self.find_trade_signal(market, current_data)
+                if trade is not TradeDirection.NONE:
+                    try:
+                        price = prices.loc[trade_dt.strftime("%Y-%m-%d"), "4. close"]
+                        trades.append(
+                            [trade_dt.strftime("%Y-%m-%d"), trade, float(price)]
+                        )
+                    except Exception as e:
+                        logging.debug(e)
+                        continue
+        if len(trades) < 2:
+            raise Exception("Not enough trades for the given date range")
+        # Iterate through trades and assess profit loss
+        balance = 1000
+        previous = trades[0]
+        for trade in trades[1:]:
+            if previous[1] is trade[1]:
+                raise Exception("Error: sequencial trades with same direction")
+            diff = trade[2] - previous[2]
+            pl = 0
+            if previous[1] is TradeDirection.BUY and trade[1] is TradeDirection.SELL:
+                pl += diff if diff >= 0 else -diff
+                # TODO consider stop and limit levels
+            if previous[1] is TradeDirection.SELL and trade[1] is TradeDirection.BUY:
+                pl += diff if diff < 0 else -diff
+                # TODO consider stop and limit levels
+            balance += pl
+            previous = trade
+        return {"balance": balance, "trades": trades}
